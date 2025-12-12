@@ -15,18 +15,20 @@ The dashboard generator consists of several components:
 ## Architecture
 
 ```
-┌─────────────────┐    ┌──────────────────┐    ┌─────────────────┐
-│   CronJob       │    │   GitLab Repo    │    │   Kubernetes    │
-│   (every 10min) │◄──►│   Template       │    │   ConfigMaps    │
-│                 │    │   Storage        │    │                 │
-└─────────────────┘    └──────────────────┘    └─────────────────┘
-         │                                                │
-         ▼                                                ▼
-┌─────────────────┐    ┌──────────────────┐    ┌─────────────────┐
-│   Service       │    │   Grafana        │    │   Prometheus     │
-│   Discovery     │───►│   Sidecar        │◄───│   Metrics        │
-│                 │    │   Auto-load      │    │                 │
-└─────────────────┘    └──────────────────┘    └─────────────────┘
+┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
+│   Kubernetes    │     │   CronJob       │     │   GitLab Repo   │
+│   Deployments   │────►│   (every 10min) │◄────┤   Template      │
+│   (monitored)   │     │   - Discovery   │     │   Storage       │
+└─────────────────┘     │   - Generation  │     └─────────────────┘
+                        │   - Deployment  │            │
+                        └─────────────────┘            ▼
+                                │                      │
+                                ▼                      │
+┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
+│   ConfigMaps    │     │   Grafana        │◄────┤   Prometheus    │
+│   (dashboards)  │────►│   Sidecar        │     │   Metrics       │
+│                 │     │   Auto-load      │     │   Loki/Tempo    │
+└─────────────────┘     └──────────────────┘     └─────────────────┘
 ```
 
 ## How It Works
