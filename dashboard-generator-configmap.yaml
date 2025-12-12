@@ -1,0 +1,224 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboards-auto-generated
+  namespace: internal
+  labels:
+    app.kubernetes.io/name: grafana
+  annotations:
+    reloader.stakater.com/match: "true"
+data: {}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dashboard-generator-script
+  namespace: internal
+data:
+  generate-dashboards.sh: |
+    #!/bin/bash
+    set -e
+
+    echo "=========================================="
+    echo "Dashboard Generator"
+    echo "=========================================="
+
+    # Ensure kubectl is in PATH
+    export PATH="/tools:$PATH"
+
+    # Set default DASHBOARDS_PATH if not provided
+    if [ -z "${DASHBOARDS_PATH}" ]; then
+      DASHBOARDS_PATH="releases/dev/tools/grafana/dashboards"
+    fi
+
+    # Discover services
+    echo "🔍 Discovering services..."
+    SERVICE_DATA=$(kubectl get deployments --all-namespaces -l monitoring=enabled -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}{"\n"}{end}' 2>/dev/null | sort -u)
+
+    if [ -z "$SERVICE_DATA" ]; then
+      echo "⚠️  No services found"
+      exit 0
+    fi
+
+    echo "✅ Services found: $(echo "$SERVICE_DATA" | wc -l)"
+    echo "$SERVICE_DATA" | sed 's/^/  - /'
+
+    # Start ConfigMap
+    cat > /tmp/dashboards-cm.yaml << 'CMHEADER'
+    apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      name: grafana-dashboards-auto-generated
+      namespace: internal
+      labels:
+        app.kubernetes.io/name: grafana
+      annotations:
+        reloader.stakater.com/match: "true"
+    data:
+    CMHEADER
+
+    # Clone GitLab repo to get template
+    echo ""
+    echo "📥 Fetching dashboard template from GitLab..."
+    TEMPLATE_DIR="/tmp/template-$(date +%s)"
+    
+    if [ -z "${GITLAB_URL}" ] || [ -z "${GITLAB_TOKEN}" ] || [ -z "${GITLAB_REPO}" ]; then
+      echo "❌ GitLab credentials not set"
+      exit 1
+    fi
+
+    git clone "https://wush:${GITLAB_TOKEN}@${GITLAB_URL}/${GITLAB_REPO}.git" "$TEMPLATE_DIR" || {
+      echo "❌ Failed to clone repository"
+      exit 1
+    }
+
+    cd "$TEMPLATE_DIR"
+    if [ -n "${GITLAB_BRANCH}" ]; then
+      git checkout "${GITLAB_BRANCH}" 2>/dev/null
+    fi
+
+    TEMPLATE_FILE="${TEMPLATE_DIR}/${DASHBOARDS_PATH}/template.json.tpl"
+    if [ ! -f "$TEMPLATE_FILE" ]; then
+      echo "❌ Template file not found: $TEMPLATE_FILE"
+      exit 1
+    fi
+
+    echo "✅ Template loaded from GitLab"
+
+    # Generate dashboards
+    echo ""
+    echo "🎨 Generating dashboards from template..."
+    dashboard_id=2000
+
+    echo "$SERVICE_DATA" | while IFS= read -r service_entry; do
+      namespace=$(echo "$service_entry" | cut -d'/' -f1)
+      service=$(echo "$service_entry" | cut -d'/' -f2)
+      service_upper=$(echo "$service" | tr '[:lower:]' '[:upper:]')
+      echo "  ✨ $namespace/$service"
+      
+      # Generate dashboard from template using envsubst
+      export SERVICE_NAME="$service"
+      export NAMESPACE="$namespace"
+      export TITLE="${service_upper} Dashboard"
+      export DASHBOARD_UID="${service}-${namespace}"
+      export DASHBOARD_ID="$dashboard_id"
+      
+      dashboard_json=$(envsubst < "$TEMPLATE_FILE" | tr -d '\n')
+
+      # Add dashboard to ConfigMap - keep as multi-line YAML literal
+      echo "  ${service}-dashboard.json: |" >> /tmp/dashboards-cm.yaml
+      echo "$dashboard_json" | sed 's/^/    /' >> /tmp/dashboards-cm.yaml
+      
+      dashboard_id=$((dashboard_id + 1))
+    done
+
+    # Apply ConfigMap - note: kube-prometheus-stack Grafana will auto-detect this
+    echo ""
+    echo "📤 Applying ConfigMap..."
+    if kubectl apply -f /tmp/dashboards-cm.yaml; then
+      echo "✅ ConfigMap applied successfully"
+      echo "ℹ️  kube-prometheus-stack Grafana will automatically load these dashboards"
+    else
+      echo "❌ Failed to apply ConfigMap"
+      exit 1
+    fi
+
+    # Push to GitLab
+    echo ""
+    echo "📤 Pushing dashboards to GitLab..."
+
+    # Clone repository
+    TEMP_DIR="/tmp/gitlab-dashboards-$(date +%s)"
+    
+    if [ -z "${GITLAB_URL}" ] || [ -z "${GITLAB_TOKEN}" ] || [ -z "${GITLAB_REPO}" ]; then
+      echo "⚠️  GitLab credentials not set, skipping Git push"
+      exit 0
+    fi
+
+    echo "Cloning from https://${GITLAB_URL}/${GITLAB_REPO}"
+    
+    # Clone with proper URL format
+    git clone "https://wush:${GITLAB_TOKEN}@${GITLAB_URL}/${GITLAB_REPO}.git" "$TEMP_DIR" || {
+      echo "⚠️  Failed to clone repository"
+      exit 0
+    }
+
+    cd "$TEMP_DIR"
+    
+    # Checkout branch
+    if [ -n "${GITLAB_BRANCH}" ]; then
+      git checkout "${GITLAB_BRANCH}" 2>/dev/null || git checkout -b "${GITLAB_BRANCH}"
+    fi
+
+    # Create dashboards directory
+    mkdir -p "${DASHBOARDS_PATH}"
+
+    # Extract and save individual dashboard ConfigMap YAML files
+    echo "💾 Extracting and applying dashboard files..."
+    
+    # Get the ConfigMap and extract data - use jq from /usr/bin
+    if kubectl get configmap grafana-dashboards-auto-generated -n internal -o json > /tmp/cm.json 2>/dev/null; then
+      /usr/bin/jq -r '.data | keys[]' /tmp/cm.json | while read -r filename; do
+        if [[ "$filename" == *.json ]]; then
+          # Remove .json extension and add .yaml
+          yaml_filename="${filename%.json}.yaml"
+          echo "  📄 $yaml_filename"
+          
+          # Extract the JSON content
+          dashboard_json=$(/usr/bin/jq -r --arg key "$filename" '.data[$key]' /tmp/cm.json)
+          
+          # Extract service name from filename (everything before -dashboard.json)
+          service_name="${filename%-dashboard.json}"
+          
+          # Create ConfigMap YAML with proper indentation
+          {
+            echo "apiVersion: v1"
+            echo "kind: ConfigMap"
+            echo "metadata:"
+            echo "  name: ${service_name}-dashboard"
+            echo "  namespace: internal"
+            echo "  labels:"
+            echo "    grafana_dashboard: \"1\""
+            echo "    app.kubernetes.io/name: grafana"
+            echo "  annotations:"
+            echo "    reloader.stakater.com/match: \"true\""
+            echo "data:"
+            echo "  ${filename}: |"
+            echo "$dashboard_json" | sed 's/^/    /'
+          } > "${DASHBOARDS_PATH}/${yaml_filename}"
+          
+          # Apply ConfigMap to cluster
+          kubectl apply -f "${DASHBOARDS_PATH}/${yaml_filename}" 2>/dev/null && echo "    ✅ Applied to cluster"
+        fi
+      done
+    else
+      echo "⚠️  Could not retrieve ConfigMap"
+    fi
+
+    # Commit and push
+    git config user.email "dashboard-generator@falahtech.com"
+    git config user.name "Dashboard Generator"
+    
+    git add "${DASHBOARDS_PATH}/" 2>/dev/null || true
+
+    if git diff --cached --quiet 2>/dev/null; then
+      echo "✅ No changes to commit"
+    else
+      git commit -m "Auto-update: Generated dashboards - $(date '+%Y-%m-%d %H:%M:%S')" 2>/dev/null || {
+        echo "⚠️  Failed to commit"
+        exit 0
+      }
+      
+      if git push origin "${GITLAB_BRANCH:-main}" 2>/dev/null; then
+        echo "✅ Pushed to GitLab successfully"
+      else
+        echo "⚠️  Failed to push to GitLab"
+      fi
+    fi
+
+    # Cleanup
+    cd /
+    rm -rf "$TEMP_DIR" "$TEMPLATE_DIR" /tmp/cm.json /tmp/dashboards-cm.yaml /tmp/template-* /tmp/gitlab-dashboards-*
+
+    echo ""
+    echo "✅ Completed! Services: $(echo "$SERVICE_DATA" | wc -l)"

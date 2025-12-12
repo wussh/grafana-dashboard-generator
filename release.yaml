@@ -1,0 +1,232 @@
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: HelmRepository
+metadata:
+  name: prometheus
+  namespace: flux-system
+spec:
+  interval: 5m
+  url: https://prometheus-community.github.io/helm-charts
+---
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: prometheus
+  namespace: internal
+spec:
+  releaseName: prometheus
+  interval: 5m
+  timeout: 15m
+  chart:
+    spec:
+      chart: kube-prometheus-stack
+      sourceRef:
+        kind: HelmRepository
+        name: prometheus
+        namespace: flux-system
+      version: "80.2.0"
+  values:
+    global:
+      rbac:
+        create: true
+    prometheus:
+      enabled: true
+      serviceMonitor:
+        enabled: true
+      prometheusSpec:
+        # Enable remote write receiver for OTEL metrics
+        enableRemoteWriteReceiver: true
+        # Enable features for OTLP and exemplars
+        enableFeatures:
+          - remote-write-receiver
+          - exemplar-storage
+          - otlp-write-receiver
+        # Retention settings
+        retention: 15d
+        retentionSize: "50GB"
+        # Exemplar storage for trace correlation
+        exemplars:
+          maxSize: 100000
+        # Scrape interval
+        scrapeInterval: 30s
+        evaluationInterval: 30s
+        # Storage
+        storageSpec:
+          volumeClaimTemplate:
+            spec:
+              accessModes: ["ReadWriteOnce"]
+              resources:
+                requests:
+                  storage: 50Gi
+        # Additional scrape configs for OTEL collector
+        additionalScrapeConfigs:
+          - job_name: 'otel-collector'
+            kubernetes_sd_configs:
+              - role: pod
+            relabel_configs:
+              - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+                action: keep
+                regex: true
+              - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+                action: replace
+                target_label: __metrics_path__
+                regex: (.+)
+              - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+                action: replace
+                regex: ([^:]+)(?::\d+)?;(\d+)
+                replacement: $1:$2
+                target_label: __address__
+    alertmanager:
+      enabled: true
+      serviceMonitor:
+        enabled: true
+    grafana:
+      enabled: true
+      serviceMonitor:
+        enabled: true
+      adminUser: admin
+      adminPassword: 123
+      # Default Prometheus datasource with UID for correlation
+      defaultDatasourceType: prometheus
+      grafana.ini:
+        feature_toggles:
+          enable: tempoSearch tempoBackendSearch tempoServiceGraph traceToMetrics correlations
+        unified_alerting:
+          enabled: true
+        alerting:
+          enabled: false
+      ingress:
+        enabled: true
+        ingressClassName: traefik
+        annotations:
+          traefik.ingress.kubernetes.io/router.entrypoints: web
+        path: /
+        hosts:
+          - grafana.10.70.0.45.nip.io
+      persistence:
+        enabled: true
+        size: 10Gi
+      resources:
+        requests:
+          cpu: 100m
+          memory: 256Mi
+        limits:
+          cpu: 200m
+          memory: 512Mi
+      sidecar:
+        dashboards:
+          enabled: true
+          label: grafana_dashboard
+          labelValue: "1"
+          searchNamespace: internal
+          folderAnnotation: grafana_folder
+          provider:
+            foldersFromFilesStructure: true
+            disableDelete: false
+            allowUiUpdates: true
+      additionalDataSources:
+        # Define Tempo first since Loki references it
+        - name: Tempo
+          type: tempo
+          uid: tempo
+          access: proxy
+          orgId: 1
+          url: http://tempo-query-frontend.internal.svc.cluster.local:3200
+          isDefault: false
+          editable: true
+          jsonData:
+            # Traces to Logs correlation
+            tracesToLogsV2:
+              datasourceUid: 'loki'
+              spanStartTimeShift: '-1h'
+              spanEndTimeShift: '1h'
+              tags: 
+                - key: 'service.name'
+                  value: 'service_name'
+                - key: 'k8s.pod.name'
+                  value: 'pod'
+                - key: 'k8s.namespace.name'
+                  value: 'namespace'
+                - key: 'cluster'
+              filterByTraceID: true
+              filterBySpanID: true
+              customQuery: true
+              query: '{namespace="$${__span.tags["k8s.namespace.name"]}", pod=~"$${__span.tags["k8s.pod.name"]}.*"} |= `$${__span.traceId}`'
+            
+            # Traces to Metrics correlation
+            tracesToMetrics:
+              datasourceUid: 'prometheus'
+              spanStartTimeShift: '-1h'
+              spanEndTimeShift: '1h'
+              tags:
+                - key: 'service.name'
+                  value: 'service'
+                - key: 'k8s.namespace.name'
+                  value: 'namespace'
+              queries:
+                - name: 'Request Rate'
+                  query: 'sum(rate(traces_spanmetrics_calls_total{service="$${__span.tags["service.name"]}"}[5m]))'
+                - name: 'Error Rate'
+                  query: 'sum(rate(traces_spanmetrics_calls_total{service="$${__span.tags["service.name"]}",status_code="STATUS_CODE_ERROR"}[5m]))'
+                - name: 'P95 Latency'
+                  query: 'histogram_quantile(0.95, sum(rate(traces_spanmetrics_latency_bucket{service="$${__span.tags["service.name"]}"}[5m])) by (le))'
+            
+            # Service Map configuration
+            serviceMap:
+              datasourceUid: 'prometheus'
+            
+            # Node Graph for trace visualization
+            nodeGraph:
+              enabled: true
+            
+            # Search configuration
+            search:
+              hide: false
+            
+            # Trace query configuration
+            traceQuery:
+              timeShiftEnabled: true
+              spanStartTimeShift: '-1h'
+              spanEndTimeShift: '1h'
+            
+            # Span bar visualization
+            spanBar:
+              type: 'Duration'
+            
+            # Enable streaming for better performance
+            streamingEnabled: true
+            
+            # Increase query timeout for large traces
+            timeout: 120
+            
+            # Lokisearch (TraceQL support)
+            lokiSearch:
+              datasourceUid: 'loki'
+        - name: Loki
+          type: loki
+          uid: loki
+          access: proxy
+          orgId: 1
+          url: http://loki-gateway.internal.svc.cluster.local
+          isDefault: false
+          editable: true
+          jsonData:
+            timeout: 120
+            maxLines: 1000
+            # Derived fields for trace correlation (Tempo link)
+            derivedFields:
+              - datasourceUid: tempo
+                matcherRegex: '"traceId":"([a-f0-9]+)"'
+                name: traceId
+                url: '$${__value.raw}'
+              - datasourceUid: tempo
+                matcherRegex: 'trace_id=([a-f0-9]+)'
+                name: traceId
+                url: '$${__value.raw}'
+      env:
+        GF_SERVER_ROOT_URL: http://grafana.10.70.0.45.nip.io:80
+    kubeStateMetrics:
+      enabled: true
+    nodeExporter:
+      enabled: true
+    pushgateway:
+      enabled: false
