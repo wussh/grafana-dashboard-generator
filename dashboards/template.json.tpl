@@ -998,7 +998,10 @@
       "type": "heatmap"
     },
     {
-      "datasource": "Tempo",
+      "datasource": {
+        "type": "tempo",
+        "uid": "tempo"
+      },
       "fieldConfig": {
         "defaults": {},
         "overrides": []
@@ -1022,6 +1025,13 @@
       "pluginVersion": "11.5.1",
       "targets": [
         {
+          "datasource": {
+            "type": "tempo",
+            "uid": "tempo"
+          },
+          "queryType": "traceql",
+          "query": "{ resource.service.name=\"${SERVICE_NAME}\" }",
+          "limit": 20,
           "refId": "A"
         }
       ],
@@ -1075,8 +1085,13 @@
       "pluginVersion": "11.5.1",
       "targets": [
         {
-          "expr": "{ service.name=\"${SERVICE_NAME}\" status=error }",
-          "format": "table",
+          "datasource": {
+            "type": "tempo",
+            "uid": "tempo"
+          },
+          "queryType": "traceql",
+          "query": "{ resource.service.name=\"${SERVICE_NAME}\" && status=error }",
+          "limit": 20,
           "refId": "A"
         }
       ],
@@ -1103,7 +1118,7 @@
         "maxLines": 1000,
         "prettifyLogMessage": false,
         "showCommonLabels": false,
-        "showLabels": true,
+        "showLabels": false,
         "showLogLevel": true,
         "showTime": true,
         "sortOrder": 1,
